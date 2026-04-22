@@ -8,7 +8,6 @@ from playwright.sync_api import sync_playwright
 SAVE_FOLDER = "icab_pdfs"
 BASE_URL = "https://www.icab.org.bd"
 
-# ICAB এর common page গুলো যেখানে PDF থাকতে পারে
 PAGES = [
     "/",
     "/page/publications",
@@ -27,7 +26,7 @@ PAGES = [
 
 def sanitize_filename(name):
     name = re.sub(r'[\\/*?:"<>|]', "_", name)
-    return name[:200]  # max filename length
+    return name[:200]
 
 
 def download_pdf(pdf_url, save_folder):
@@ -39,14 +38,14 @@ def download_pdf(pdf_url, save_folder):
         response = requests.get(pdf_url, headers=headers,
                                 timeout=30, stream=True)
         if response.status_code == 200:
-            # Filename বের করো URL থেকে
             filename = os.path.basename(urlparse(pdf_url).path)
             filename = sanitize_filename(filename)
+            if not filename or filename == ".pdf":
+                filename = f"doc_{hash(pdf_url) % 100000}.pdf"
             if not filename.endswith(".pdf"):
                 filename += ".pdf"
 
             filepath = os.path.join(save_folder, filename)
-            # Duplicate হলে rename
             counter = 1
             base, ext = os.path.splitext(filepath)
             while os.path.exists(filepath):
@@ -67,67 +66,80 @@ def download_pdf(pdf_url, save_folder):
     return False
 
 
+def safe_goto(page, url, retries=2):
+    """Timeout-safe page navigation — networkidle এর বদলে domcontentloaded ব্যবহার করে"""
+    for attempt in range(retries):
+        try:
+            # networkidle এর বদলে domcontentloaded — অনেক দ্রুত
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            # JS render এর জন্য একটু অপেক্ষা
+            time.sleep(3)
+            return True
+        except Exception as e:
+            print(f"  ⚠️ Attempt {attempt+1} failed: {e}")
+            time.sleep(2)
+    return False
+
+
 def extract_pdfs_from_page(page, url):
-    """একটা page থেকে সব PDF link বের করো"""
     pdf_urls = set()
 
     print(f"\n📄 Scanning: {url}")
-    try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        time.sleep(3)
 
-        # Scroll করো lazy content এর জন্য
-        for _ in range(5):
-            page.mouse.wheel(0, 1500)
-            time.sleep(0.8)
-        page.mouse.wheel(0, -99999)  # উপরে ফিরে যাও
-        time.sleep(1)
-
-    except Exception as e:
-        print(f"  ⚠️ Page load error: {e}")
+    if not safe_goto(page, url):
+        print(f"  ❌ Skipping (could not load)")
         return pdf_urls
 
-    # ১. সব <a href> এ .pdf আছে কিনা দেখো
-    links = page.query_selector_all("a[href]")
-    for link in links:
-        href = link.get_attribute("href") or ""
-        if ".pdf" in href.lower():
-            full_url = urljoin(
-                BASE_URL, href) if href.startswith("/") else href
-            if full_url.startswith("http"):
+    # Scroll করো
+    try:
+        for _ in range(4):
+            page.mouse.wheel(0, 1500)
+            time.sleep(0.6)
+    except:
+        pass
+
+    # ১. <a href> এ .pdf
+    try:
+        links = page.query_selector_all("a[href]")
+        for link in links:
+            href = link.get_attribute("href") or ""
+            if ".pdf" in href.lower():
+                full_url = urljoin(BASE_URL, href) if not href.startswith(
+                    "http") else href
                 pdf_urls.add(full_url)
+    except Exception as e:
+        print(f"  ⚠️ Link scan error: {e}")
 
-    # ২. Page source থেকে PDF URL regex দিয়ে বের করো
-    content = page.content()
-    # http বা /path দিয়ে শুরু PDF link
-    matches = re.findall(
-        r'["\']((?:https?://[^"\']+|/[^"\']+)\.pdf(?:\?[^"\']*)?)["\']', content, re.IGNORECASE)
-    for match in matches:
-        full_url = urljoin(BASE_URL, match) if match.startswith("/") else match
-        pdf_urls.add(full_url)
-
-    # ৩. onclick বা data attribute এ PDF link থাকতে পারে
-    onclick_matches = re.findall(
-        r'(?:onclick|data-url|data-href)=["\']([^"\']*\.pdf[^"\']*)["\']', content, re.IGNORECASE)
-    for match in onclick_matches:
-        full_url = urljoin(BASE_URL, match) if match.startswith("/") else match
-        if full_url.startswith("http"):
+    # ২. Page source থেকে regex
+    try:
+        content = page.content()
+        matches = re.findall(
+            r'["\']((?:https?://[^"\']+|/[^"\']+)\.pdf(?:\?[^"\']*)?)["\']',
+            content, re.IGNORECASE
+        )
+        for match in matches:
+            full_url = urljoin(
+                BASE_URL, match) if match.startswith("/") else match
             pdf_urls.add(full_url)
+    except Exception as e:
+        print(f"  ⚠️ Regex scan error: {e}")
 
     print(f"  → {len(pdf_urls)} PDFs found")
     return pdf_urls
 
 
-def find_subpages(page, url):
-    """Page এর ভেতরে আরও subpage link খোঁজো"""
+def find_subpages(page):
+    """Homepage থেকে internal link collect করো"""
     subpages = set()
     try:
         links = page.query_selector_all("a[href]")
         for link in links:
             href = link.get_attribute("href") or ""
-            if href.startswith("/") and href != "/" and ".pdf" not in href.lower():
-                full = BASE_URL + href
-                subpages.add(full)
+            if (href.startswith("/") and href != "/" and
+                    ".pdf" not in href.lower() and
+                    "mailto" not in href and
+                    "tel:" not in href):
+                subpages.add(BASE_URL + href)
             elif href.startswith(BASE_URL) and ".pdf" not in href.lower():
                 subpages.add(href)
     except:
@@ -141,25 +153,39 @@ def main():
     visited = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            # Slow site এর জন্য timeout বাড়ানো
+            java_script_enabled=True,
         )
         bpage = context.new_page()
+        # Default timeout বাড়াও
+        bpage.set_default_timeout(45000)
 
-        # প্রথমে homepage load করো এবং সব internal link collect করো
-        print("🔍 Discovering pages...")
-        bpage.goto(BASE_URL, wait_until="networkidle", timeout=30000)
-        time.sleep(3)
-        nav_links = find_subpages(bpage, BASE_URL)
-        print(f"  → {len(nav_links)} internal pages found from homepage")
+        # Homepage load
+        print("🔍 Loading homepage...")
+        if not safe_goto(bpage, BASE_URL):
+            print("❌ Homepage load failed। Internet connection বা site check করুন।")
+            browser.close()
+            return
 
-        # Pre-defined pages + discovered pages মেলাও
-        all_pages = set([BASE_URL + p for p in PAGES]) | nav_links
-        print(f"  → Total pages to scan: {len(all_pages)}")
+        print("✅ Homepage loaded!")
 
-        # প্রতিটা page scan করো
+        # Internal links discover
+        nav_links = find_subpages(bpage)
+        print(f"  → {len(nav_links)} internal pages found")
+
+        # সব pages একসাথে
+        predefined = set([BASE_URL + p for p in PAGES])
+        all_pages = predefined | nav_links
+        print(f"  → Total pages to scan: {len(all_pages)}\n")
+
+        # প্রতিটা page scan
         for page_url in all_pages:
             if page_url in visited:
                 continue
@@ -171,16 +197,15 @@ def main():
 
     print(f"\n{'='*50}")
     print(f"📥 Total unique PDFs found: {len(all_pdfs)}")
-    print(f"{'='*50}")
+    print(f"{'='*50}\n")
 
     if not all_pdfs:
         print("❌ কোনো PDF পাওয়া যায়নি।")
         return
 
-    # Download করো
     downloaded = 0
     failed = 0
-    for pdf_url in all_pdfs:
+    for pdf_url in sorted(all_pdfs):
         if download_pdf(pdf_url, SAVE_FOLDER):
             downloaded += 1
         else:
